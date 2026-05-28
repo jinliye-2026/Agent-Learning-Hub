@@ -1,0 +1,178 @@
+让模型稳定输出结构化 JSON，本质上需要从**提示设计**、**接口约束**和**后处理容错**三个层面配合。下面按推荐程度，给出最实用的方法。
+
+---
+
+## 一、优先使用原生 JSON 模式（最可靠）
+
+如果所用的模型 API 支持 **JSON 模式**（如 OpenAI、Claude、部分开源推理框架），应优先启用。它会在采样时限制 token，只生成合法 JSON。
+
+**OpenAI 风格**（GPT-4o、GPT-4 等）  
+在 `response_format` 中指定类型，并**在提示中写明 JSON 结构**。
+
+```python
+response = client.chat.completions.create(
+    model="gpt-4o",
+    messages=[
+        {
+            "role": "system",
+            "content": "输出一个 JSON 对象，包含字段：name(string), age(int), skills(string[])"
+        },
+        {"role": "user", "content": "张三，28岁，会 Python 和 机器学习"}
+    ],
+    response_format={"type": "json_object"}   # 关键参数
+)
+```
+
+> **注意**：GPT-3.5/4 的 `json_object` 模式仍需要 prompt 里出现 “JSON” 字样，否则可能报错。更精确的结构约束，建议使用下方的 **Function Calling** 方式。
+
+**Claude（Anthropic）风格**  
+通过提示要求输出 JSON，并利用预填 `{` 来强制开口：
+
+```python
+response = anthropic.messages.create(
+    model="claude-3-5-sonnet",
+    system="只输出 JSON，不要其他文字。",
+    messages=[{"role": "user", "content": "描述一个人：张三，28岁"}],
+    # 预填开头，强制以 JSON 开始
+    assistant_partial="{",
+    stop_sequences=["\n\n"]
+)
+```
+
+很多开源模型（通过 vLLM、Ollama 部署）现在也支持设置 `response_format` 为 `json_object`，原理类似。
+
+---
+
+## 二、用 Function Calling / Tool Use 承载结构化输出
+
+这是一种更严格的“结构化输出”方法：定义函数的参数 schema，让模型通过调用函数来返回数据。几乎所有主流 API 都支持。
+
+**OpenAI 函数调用示例**
+
+```python
+tools = [{
+    "type": "function",
+    "function": {
+        "name": "output_person_info",
+        "description": "输出人员信息",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string"},
+                "age": {"type": "integer"},
+                "skills": {
+                    "type": "array",
+                    "items": {"type": "string"}
+                }
+            },
+            "required": ["name", "age", "skills"]
+        }
+    }
+}]
+
+response = client.chat.completions.create(
+    model="gpt-4o",
+    messages=[{"role": "user", "content": "张三，28岁，会 Python 和机器学习"}],
+    tools=tools,
+    tool_choice={"type": "function", "function": {"name": "output_person_info"}}
+)
+
+# 解析返回的函数调用参数
+import json
+args = json.loads(response.choices[0].message.tool_calls[0].function.arguments)
+# args 就是结构化 dict
+```
+
+这种方式的好处：
+- 模型严格按你给的 JSON Schema 填充数据。
+- 不再需要在 prompt 里反复强调格式，天然防止无关文字。
+
+---
+
+## 三、若只能靠提示词，用“格式模板 + 防错指南”
+
+当 API 不支持 JSON 模式或函数调用时，只能通过精心设计提示，并配合后处理来保证结构。
+
+**推荐提示结构**：
+1. 明确要求输出纯 JSON，不带 markdown 代码块。
+2. 给出完整的目标 JSON 样例。
+3. 强调不要添加解释文字。
+
+**示例提示词**：
+
+```
+系统指令：
+你是一个 JSON 生成器。你必须严格按下面格式输出，不要任何额外文字，不要 markdown 代码块。
+
+输出格式：
+{
+  "name": "<string>",
+  "age": <int>,
+  "skills": ["<string>"]
+}
+
+用户输入：
+张三，28岁，会 Python 和机器学习
+
+你应该输出：
+```
+
+**后处理提取 JSON**（防模型多嘴）：
+
+```python
+import re, json
+
+def extract_json(text: str):
+    # 尝试提取第一个 {...} 或 [...] 块
+    match = re.search(r'(\[.*\]|{.*})', text, re.DOTALL)
+    if match:
+        return json.loads(match.group())
+    raise ValueError("未找到 JSON")
+```
+
+---
+
+## 四、用 Instructor / Pydantic 在代码层约束结构（高级封装）(主流)
+
+[Instructor](https://python.useinstructor.com/) 库封装了 OpenAI/Anthropic 等客户端，让你直接用 Pydantic 模型定义期望结构，它在底层通过函数调用或提示策略保证输出符合模型定义，自动重试和修复。
+
+```python
+import instructor
+from openai import OpenAI
+from pydantic import BaseModel
+
+class Person(BaseModel):
+    name: str
+    age: int
+    skills: list[str]
+
+client = instructor.from_openai(OpenAI())
+
+person = client.chat.completions.create(
+    model="gpt-4o",
+    response_model=Person,
+    messages=[{"role": "user", "content": "张三，28岁，会 Python 和机器学习"}]
+)
+# person 直接是 Person 实例
+print(person.name, person.age, person.skills)
+```
+
+对复杂嵌套结构、枚举字段、可选字段，用 Pydantic 定义非常方便。Instructor 还支持在出错时自动要求模型修正，鲁棒性很高。
+
+---
+
+## 总结选择策略
+
+| 场景 | 推荐方法 |
+|------|----------|
+| API 支持 JSON 模式 | 启用 `response_format: json_object` + 提示明确结构 |
+| 需要字段精准、防幻觉 | 使用 **Function Calling / Tool Use** |
+| 仅靠提示词 | 给出严格格式示例 + 后处理正则提取 |
+| 复杂嵌套、快速开发 | 用 **Instructor + Pydantic** |
+
+**共同注意事项**：
+- 始终在提示中给 JSON 样例，即使开了 JSON 模式。
+- 数组和字符串内的特殊字符需考虑转义，可让模型输出后做 `json.loads` 验证。
+- 如果模型很小，能力有限，可降低期望，使用极简扁平 JSON 结构。
+
+这样组合使用，基本可以做到稳定、可解析的结构化 JSON 输出。
